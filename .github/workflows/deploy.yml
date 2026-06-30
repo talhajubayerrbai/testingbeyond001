@@ -114,7 +114,7 @@ jobs:
       - name: Set up SSH private key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" | base64 -d > /tmp/deploy_key
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
           chmod 600 /tmp/deploy_key
 
       - name: Wait for SSH to be available
