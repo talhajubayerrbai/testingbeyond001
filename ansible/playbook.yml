@@ -1,22 +1,15 @@
 ---
-- name: Deploy FastAPI application
+- name: Configure and deploy FastAPI application
   hosts: all
   become: true
-  gather_facts: true
-
   vars:
     app_dir: /opt/app
     venv_dir: /opt/app/.venv
-    app_user: ubuntu
+    app_user: appuser
     app_port: 8000
-    gunicorn_workers: 4
-    project_name: "{{ project_name | default('app') }}"
+    artifact_path: /tmp/app.tar.gz
 
   tasks:
-
-    # -------------------------------------------------------------------------
-    # System packages
-    # -------------------------------------------------------------------------
     - name: Update apt cache
       apt:
         update_cache: yes
@@ -30,15 +23,20 @@
           - python3.11-dev
           - python3-pip
           - nginx
-          - git
           - curl
           - build-essential
+          - git
         state: present
 
-    # -------------------------------------------------------------------------
-    # Application directory and code
-    # -------------------------------------------------------------------------
-    - name: Create application directory
+    - name: Create app user
+      user:
+        name: "{{ app_user }}"
+        system: yes
+        shell: /bin/false
+        home: "{{ app_dir }}"
+        create_home: no
+
+    - name: Create app directory
       file:
         path: "{{ app_dir }}"
         state: directory
@@ -46,25 +44,22 @@
         group: "{{ app_user }}"
         mode: "0755"
 
-    - name: Copy application code to server
-      synchronize:
-        src: "{{ playbook_dir }}/../"
-        dest: "{{ app_dir }}/"
-        recursive: yes
-        delete: yes
-        rsync_opts:
-          - "--exclude=.git"
-          - "--exclude=.github"
-          - "--exclude=terraform"
-          - "--exclude=ansible"
-          - "--exclude=__pycache__"
-          - "--exclude=*.pyc"
-          - "--exclude=.venv"
-          - "--exclude=venv"
-          - "--exclude=*.egg-info"
-        checksum: yes
+    - name: Copy application archive to server
+      copy:
+        src: "{{ artifact_path }}"
+        dest: /tmp/app_deploy.tar.gz
+        mode: "0644"
 
-    - name: Set ownership of application directory
+    - name: Extract application archive
+      unarchive:
+        src: /tmp/app_deploy.tar.gz
+        dest: "{{ app_dir }}"
+        remote_src: yes
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        extra_opts: ["--strip-components=0"]
+
+    - name: Set ownership of app directory
       file:
         path: "{{ app_dir }}"
         state: directory
@@ -72,62 +67,45 @@
         group: "{{ app_user }}"
         recurse: yes
 
-    # -------------------------------------------------------------------------
-    # Python virtual environment and dependencies
-    # -------------------------------------------------------------------------
     - name: Create Python virtual environment
-      command:
-        cmd: python3.11 -m venv "{{ venv_dir }}"
-        creates: "{{ venv_dir }}/bin/python"
+      command: python3.11 -m venv {{ venv_dir }}
+      args:
+        creates: "{{ venv_dir }}/bin/activate"
       become_user: "{{ app_user }}"
 
-    - name: Upgrade pip inside venv
-      command:
-        cmd: "{{ venv_dir }}/bin/pip install --upgrade pip"
+    - name: Upgrade pip in venv
+      command: "{{ venv_dir }}/bin/pip install --upgrade pip"
       become_user: "{{ app_user }}"
 
     - name: Install Python dependencies from requirements.txt
-      command:
-        cmd: "{{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt"
+      command: "{{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt"
+      args:
+        chdir: "{{ app_dir }}"
       become_user: "{{ app_user }}"
-      when: lookup('fileglob', '{{ app_dir }}/requirements.txt') | length > 0
-      ignore_errors: true
+      ignore_errors: yes
 
-    - name: Install core Python packages
-      command:
-        cmd: "{{ venv_dir }}/bin/pip install fastapi uvicorn[standard] gunicorn httpx"
+    - name: Install gunicorn and uvicorn workers
+      command: "{{ venv_dir }}/bin/pip install gunicorn uvicorn[standard] fastapi"
       become_user: "{{ app_user }}"
 
-    # -------------------------------------------------------------------------
-    # Render .env file via shell (handles empty/missing values safely)
-    # -------------------------------------------------------------------------
-    - name: Write application .env file
+    - name: Write application environment file
       shell: |
-        cat > {{ app_dir }}/.env <<'ENVEOF'
+        cat > {{ app_dir }}/.env << 'ENVEOF'
         APP_ENV=production
         PORT=8000
         HOST=0.0.0.0
         ENVEOF
-      args:
-        executable: /bin/bash
+        chown {{ app_user }}:{{ app_user }} {{ app_dir }}/.env
+        chmod 640 {{ app_dir }}/.env
 
-    - name: Set ownership of .env file
-      file:
-        path: "{{ app_dir }}/.env"
-        owner: "{{ app_user }}"
-        group: "{{ app_user }}"
-        mode: "0640"
-
-    # -------------------------------------------------------------------------
-    # Systemd service for gunicorn
-    # -------------------------------------------------------------------------
-    - name: Create gunicorn systemd service
+    - name: Create systemd service unit
       copy:
         dest: /etc/systemd/system/app.service
         content: |
           [Unit]
-          Description=FastAPI application (gunicorn + uvicorn workers)
+          Description=FastAPI Application (gunicorn + uvicorn)
           After=network.target
+          Wants=network.target
 
           [Service]
           Type=notify
@@ -136,46 +114,23 @@
           WorkingDirectory={{ app_dir }}
           EnvironmentFile={{ app_dir }}/.env
           ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
-                      -k uvicorn.workers.UvicornWorker \
-                      -w {{ gunicorn_workers }} \
-                      -b 0.0.0.0:{{ app_port }} \
-                      --timeout 120 \
-                      --graceful-timeout 30 \
-                      --keep-alive 5 \
-                      --access-logfile - \
-                      --error-logfile -
+              -k uvicorn.workers.UvicornWorker \
+              -w 4 \
+              -b 0.0.0.0:{{ app_port }} \
+              --timeout 120 \
+              --access-logfile - \
+              --error-logfile -
           ExecReload=/bin/kill -s HUP $MAINPID
-          KillMode=mixed
-          TimeoutStopSec=5
-          PrivateTmp=true
           Restart=on-failure
           RestartSec=5
+          KillMode=mixed
+          TimeoutStopSec=30
 
           [Install]
           WantedBy=multi-user.target
-        owner: root
-        group: root
         mode: "0644"
 
-    - name: Reload systemd daemon
-      systemd:
-        daemon_reload: yes
-
-    - name: Enable and start gunicorn service
-      systemd:
-        name: app
-        state: restarted
-        enabled: yes
-
-    # -------------------------------------------------------------------------
-    # Nginx reverse proxy
-    # -------------------------------------------------------------------------
-    - name: Remove default nginx site
-      file:
-        path: /etc/nginx/sites-enabled/default
-        state: absent
-
-    - name: Create nginx site configuration
+    - name: Configure nginx reverse proxy
       copy:
         dest: /etc/nginx/sites-available/app
         content: |
@@ -183,7 +138,8 @@
               listen 80;
               server_name _;
 
-              client_max_body_size 50M;
+              access_log /var/log/nginx/app_access.log;
+              error_log  /var/log/nginx/app_error.log;
 
               location / {
                   proxy_pass         http://127.0.0.1:{{ app_port }};
@@ -194,12 +150,10 @@
                   proxy_set_header   X-Real-IP $remote_addr;
                   proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_set_header   X-Forwarded-Proto $scheme;
-                  proxy_read_timeout 300s;
-                  proxy_connect_timeout 75s;
+                  proxy_read_timeout 300;
+                  proxy_connect_timeout 300;
               }
           }
-        owner: root
-        group: root
         mode: "0644"
 
     - name: Enable nginx site
@@ -208,19 +162,31 @@
         dest: /etc/nginx/sites-enabled/app
         state: link
 
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
     - name: Test nginx configuration
       command: nginx -t
       changed_when: false
 
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start application service
+      systemd:
+        name: app
+        enabled: yes
+        state: restarted
+
     - name: Enable and restart nginx
       systemd:
         name: nginx
-        state: restarted
         enabled: yes
+        state: restarted
 
-    # -------------------------------------------------------------------------
-    # Health check on the server itself
-    # -------------------------------------------------------------------------
     - name: Wait for application to become healthy
       uri:
         url: "http://localhost:{{ app_port }}/health"

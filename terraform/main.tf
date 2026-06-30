@@ -1,6 +1,4 @@
 terraform {
-  required_version = ">= 1.5.0"
-
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -15,32 +13,17 @@ provider "aws" {
   region = var.aws_region
 }
 
-# ---------------------------------------------------------------------------
-# Variables
-# ---------------------------------------------------------------------------
-
 variable "aws_region" {
-  description = "AWS region"
-  default     = "us-east-1"
+  default = "us-east-1"
 }
 
 variable "instance_type" {
-  description = "EC2 instance type"
-  default     = "t3.micro"
+  default = "t3.micro"
 }
 
-variable "public_key" {
-  description = "SSH public key material for the EC2 key pair"
-}
+variable "public_key" {}
 
-variable "project_name" {
-  description = "Project name (used for tagging and naming)"
-  default     = "app"
-}
-
-# ---------------------------------------------------------------------------
-# Data sources
-# ---------------------------------------------------------------------------
+variable "project_name" {}
 
 data "aws_ami" "ubuntu" {
   most_recent = true
@@ -57,72 +40,23 @@ data "aws_ami" "ubuntu" {
   }
 }
 
-# ---------------------------------------------------------------------------
-# Networking
-# ---------------------------------------------------------------------------
-
-resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-
-  tags = {
-    Name    = "${var.project_name}-vpc"
-    Project = var.project_name
-  }
+resource "aws_key_pair" "app" {
+  key_name   = "${var.project_name}-key"
+  public_key = var.public_key
 }
-
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
-
-  tags = {
-    Name    = "${var.project_name}-igw"
-    Project = var.project_name
-  }
-}
-
-resource "aws_subnet" "public" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
-  map_public_ip_on_launch = true
-  availability_zone       = "${var.aws_region}a"
-
-  tags = {
-    Name    = "${var.project_name}-public-subnet"
-    Project = var.project_name
-  }
-}
-
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
-  }
-
-  tags = {
-    Name    = "${var.project_name}-rt"
-    Project = var.project_name
-  }
-}
-
-resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
-  route_table_id = aws_route_table.public.id
-}
-
-# ---------------------------------------------------------------------------
-# Security Group
-# ---------------------------------------------------------------------------
 
 resource "aws_security_group" "app" {
   name        = "${var.project_name}-sg"
-  description = "Allow HTTP, HTTPS, and SSH"
-  vpc_id      = aws_vpc.main.id
+  description = "Security group for ${var.project_name} app"
 
   ingress {
-    description = "HTTP"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -130,17 +64,8 @@ resource "aws_security_group" "app" {
   }
 
   ingress {
-    description = "HTTPS"
     from_port   = 443
     to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -153,35 +78,16 @@ resource "aws_security_group" "app" {
   }
 
   tags = {
+    Project = var.project_name
     Name    = "${var.project_name}-sg"
-    Project = var.project_name
   }
 }
-
-# ---------------------------------------------------------------------------
-# SSH Key Pair
-# ---------------------------------------------------------------------------
-
-resource "aws_key_pair" "app" {
-  key_name   = "${var.project_name}-keypair"
-  public_key = var.public_key
-
-  tags = {
-    Name    = "${var.project_name}-keypair"
-    Project = var.project_name
-  }
-}
-
-# ---------------------------------------------------------------------------
-# EC2 Instance
-# ---------------------------------------------------------------------------
 
 resource "aws_instance" "app" {
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.app.id]
   key_name               = aws_key_pair.app.key_name
+  vpc_security_group_ids = [aws_security_group.app.id]
 
   root_block_device {
     volume_size = 20
@@ -189,35 +95,25 @@ resource "aws_instance" "app" {
   }
 
   tags = {
-    Name    = "${var.project_name}-app"
     Project = var.project_name
+    Name    = "${var.project_name}-app"
   }
 }
-
-# ---------------------------------------------------------------------------
-# Elastic IP (stable public address)
-# ---------------------------------------------------------------------------
 
 resource "aws_eip" "app" {
   instance = aws_instance.app.id
   domain   = "vpc"
 
   tags = {
-    Name    = "${var.project_name}-eip"
     Project = var.project_name
+    Name    = "${var.project_name}-eip"
   }
 }
 
-# ---------------------------------------------------------------------------
-# Outputs
-# ---------------------------------------------------------------------------
-
 output "instance_public_ip" {
-  description = "Static public IP of the EC2 instance"
-  value       = aws_eip.app.public_ip
+  value = aws_eip.app.public_ip
 }
 
 output "app_url" {
-  description = "Public URL of the application"
-  value       = "http://${aws_eip.app.public_ip}"
+  value = "http://${aws_eip.app.public_ip}"
 }

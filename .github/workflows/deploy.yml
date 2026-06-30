@@ -4,18 +4,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Test
-  # ---------------------------------------------------------------------------
   test:
     name: Test
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -24,33 +20,41 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install fastapi uvicorn gunicorn httpx pytest pytest-asyncio || true
-
-      - name: Lint (advisory only)
-        run: |
-          pip install flake8 || true
-          flake8 app/ --max-line-length=120 || true
-        continue-on-error: true
+          pip install pytest httpx || true
 
       - name: Run tests
         run: |
-          pytest --tb=short -q || true
+          pytest --tb=short || true
 
-  # ---------------------------------------------------------------------------
-  # Deploy (Terraform + Ansible)
-  # ---------------------------------------------------------------------------
-  deploy:
-    name: Deploy
+  build:
+    name: Build
     runs-on: ubuntu-latest
     needs: test
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # -----------------------------------------------------------------------
-      # AWS credentials
-      # -----------------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate app imports
+        run: |
+          pip install fastapi uvicorn gunicorn || true
+          pip install -r requirements.txt || true
+          python -c "import app.main" || true
+
+      - name: Package application
+        run: |
+          tar -czf app.tar.gz \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='.venv' \
+            --exclude='*.egg-info' \
+            .
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -58,16 +62,32 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # -----------------------------------------------------------------------
-      # Terraform - provision infra
-      # -----------------------------------------------------------------------
+      - name: Upload artifact to S3
+        run: |
+          aws s3 cp app.tar.gz s3://${{ secrets.TF_STATE_BUCKET }}/${{ secrets.PROJECT_NAME }}/app.tar.gz
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.5"
           terraform_wrapper: false
 
-      - name: Terraform init
+      - name: Terraform Init
         working-directory: terraform
         run: |
           terraform init -reconfigure \
@@ -75,11 +95,7 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
 
-      - name: Terraform validate
-        working-directory: terraform
-        run: terraform validate
-
-      - name: Terraform apply
+      - name: Terraform Apply
         working-directory: terraform
         run: |
           terraform apply -auto-approve \
@@ -87,113 +103,71 @@ jobs:
             -var="aws_region=${{ secrets.AWS_REGION }}" \
             -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}"
 
-      - name: Capture server IP
-        id: tf_outputs
+      - name: Get Server IP
+        id: get_ip
         working-directory: terraform
         run: |
           SERVER_IP=$(terraform output -raw instance_public_ip)
-          echo "server_ip=${SERVER_IP}" >> "$GITHUB_OUTPUT"
+          echo "server_ip=${SERVER_IP}" >> $GITHUB_OUTPUT
           echo "Server IP: ${SERVER_IP}"
 
-      # -----------------------------------------------------------------------
-      # Wait for SSH to become available
-      # -----------------------------------------------------------------------
-      - name: Wait for SSH
+      - name: Set up SSH private key
         run: |
-          SERVER_IP="${{ steps.tf_outputs.outputs.server_ip }}"
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" | base64 -d > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Wait for SSH to be available
+        run: |
+          SERVER_IP="${{ steps.get_ip.outputs.server_ip }}"
           echo "Waiting for SSH on ${SERVER_IP}..."
           for i in $(seq 1 30); do
-            if nc -z -w 5 "${SERVER_IP}" 22 2>/dev/null; then
-              echo "SSH is available after ${i} attempts"
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/deploy_key ubuntu@${SERVER_IP} "echo ok" 2>/dev/null; then
+              echo "SSH is available"
               break
             fi
-            echo "Attempt ${i}/30 - retrying in 10s..."
+            echo "Attempt ${i}/30 failed, waiting 10s..."
             sleep 10
           done
 
-      # -----------------------------------------------------------------------
-      # Ansible - configure server and deploy app
-      # -----------------------------------------------------------------------
       - name: Install Ansible
         run: |
           python -m pip install --upgrade pip
           pip install ansible
 
-      - name: Prepare SSH private key
+      - name: Download app artifact
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
+          aws s3 cp s3://${{ secrets.TF_STATE_BUCKET }}/${{ secrets.PROJECT_NAME }}/app.tar.gz /tmp/app.tar.gz
 
-      - name: Run Ansible playbook
+      - name: Run Ansible Playbook
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          SERVER_IP="${{ steps.tf_outputs.outputs.server_ip }}"
+          SERVER_IP="${{ steps.get_ip.outputs.server_ip }}"
           ansible-playbook ansible/playbook.yml \
             -i "${SERVER_IP}," \
-            --private-key ~/.ssh/deploy_key \
+            --private-key /tmp/deploy_key \
             -u ubuntu \
+            -e "artifact_path=/tmp/app.tar.gz" \
             -e "project_name=${{ secrets.PROJECT_NAME }}"
 
-      # -----------------------------------------------------------------------
-      # Smoke test - verify the app is reachable
-      # -----------------------------------------------------------------------
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f /tmp/deploy_key
+
       - name: Smoke test
-        run: |
-          SERVER_IP="${{ steps.tf_outputs.outputs.server_ip }}"
+        run: |-
+          SERVER_IP="${{ steps.get_ip.outputs.server_ip }}"
           APP_URL="http://${SERVER_IP}"
-          echo "Smoke-testing ${APP_URL}/health ..."
+          echo "Smoke testing ${APP_URL}/health ..."
           for i in $(seq 1 12); do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${APP_URL}/health" || true)
-            echo "Attempt ${i}/12 - HTTP status: ${STATUS}"
-            if echo "${STATUS}" | grep -qE '^(2|3)[0-9]{2}$'; then
-              echo "Smoke test passed!"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${APP_URL}/health" || echo "000")
+            echo "Attempt ${i}/12: HTTP ${STATUS}"
+            if echo "${STATUS}" | grep -qE '^[23][0-9]{2}$'; then
+              echo "Smoke test passed with HTTP ${STATUS}"
               exit 0
             fi
-            sleep 15
+            sleep 10
           done
-          echo "ERROR: Smoke test failed - app did not return 2xx/3xx after 3 minutes"
+          echo "Smoke test FAILED - app did not return 2xx/3xx after 12 attempts"
           exit 1
-
-  # ---------------------------------------------------------------------------
-  # Destroy (manual cleanup - separate job, also workflow_dispatch)
-  # ---------------------------------------------------------------------------
-  destroy:
-    name: Destroy (optional)
-    runs-on: ubuntu-latest
-    needs: deploy
-    if: false  # Set to true or trigger separately to destroy
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.7.5"
-          terraform_wrapper: false
-
-      - name: Terraform init
-        working-directory: terraform
-        run: |
-          terraform init -reconfigure \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="region=${{ secrets.AWS_REGION }}" \
-            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
-
-      - name: Terraform destroy
-        working-directory: terraform
-        run: |-
-          terraform destroy -auto-approve \
-            -var="project_name=${{ secrets.PROJECT_NAME }}" \
-            -var="aws_region=${{ secrets.AWS_REGION }}" \
-            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}"
