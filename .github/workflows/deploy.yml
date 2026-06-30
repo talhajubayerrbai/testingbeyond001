@@ -47,7 +47,7 @@ jobs:
 
       - name: Package application
         run: |
-          tar -czf app.tar.gz \
+          tar -czf /tmp/app.tar.gz \
             --exclude='.git' \
             --exclude='__pycache__' \
             --exclude='*.pyc' \
@@ -64,7 +64,7 @@ jobs:
 
       - name: Upload artifact to S3
         run: |
-          aws s3 cp app.tar.gz s3://${{ secrets.TF_STATE_BUCKET }}/${{ secrets.PROJECT_NAME }}/app.tar.gz
+          aws s3 cp /tmp/app.tar.gz s3://${{ secrets.TF_STATE_BUCKET }}/${{ secrets.PROJECT_NAME }}/app.tar.gz
 
   deploy:
     name: Deploy
