@@ -26,6 +26,7 @@
           - curl
           - build-essential
           - git
+          - acl
         state: present
 
     - name: Create app user
